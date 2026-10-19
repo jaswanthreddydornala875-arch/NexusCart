@@ -1,0 +1,24 @@
+# Backend
+Flask>=3.0
+Flask-SQLAlchemy>=3.1
+Flask-CORS>=4.0
+Flask-JWT-Extended>=4.6
+bcrypt>=4.1
+python-dotenv>=1.0
+psycopg2-binary>=2.9        # PostgreSQL driver (for MySQL use: PyMySQL)
+requests>=2.31
+
+# Payments
+razorpay>=1.4
+# stripe>=8.0               # optional second gateway
+
+# Frontend (optional: JPG/WEBP product images, smoother resizing)
+Pillow>=10.0
+
+# AI features
+scikit-learn>=1.4
+numpy>=1.26
+vaderSentiment>=3.3
+
+# Tests
+pytest>=8.0
