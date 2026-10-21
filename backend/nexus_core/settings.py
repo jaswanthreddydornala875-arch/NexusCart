@@ -10,22 +10,29 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 
+import os
 from pathlib import Path
+
+import dj_database_url
+from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+REPO_ROOT = BASE_DIR.parent
+load_dotenv(REPO_ROOT / ".env")
 
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-*lo&&z2+2ad%w8u3$6++v)vm_ew(4aooqb5mu_e^#c@nw9f0#@'
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-only-change-this-secret-key")
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.getenv("DJANGO_DEBUG", "true").lower() in {"1", "true", "yes"}
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [host.strip() for host in os.getenv("DJANGO_ALLOWED_HOSTS", "127.0.0.1,localhost").split(",")
+                 if host.strip()]
 
 
 # Application definition
@@ -74,14 +81,10 @@ WSGI_APPLICATION = 'nexus_core.wsgi.application'
 # https://docs.djangoproject.com/en/6.1/ref/settings/#databases
 
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'nexuscart',
-        'USER': 'postgres',
-        'PASSWORD': 'Ishant@6709',
-        'HOST': '127.0.0.1',
-        'PORT': '5432',
-    }
+    "default": dj_database_url.config(
+        default=f"sqlite:///{REPO_ROOT / 'backend' / 'db.sqlite3'}",
+        conn_max_age=600,
+    )
 }
 
 
@@ -131,3 +134,4 @@ MAILERS = {
     },
 }
 AUTH_USER_MODEL = "store.User"
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"

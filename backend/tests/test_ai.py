@@ -1,3 +1,5 @@
+import warnings
+
 import pytest
 
 from app import create_app
@@ -9,8 +11,13 @@ from app.ai.sentiment import SentimentAnalyzer
 from app.ai.smart_search import SmartSearch
 
 
-@pytest.fixture(scope="module")
-def e():
+@pytest.fixture(autouse=True)
+def use_demo_catalog(monkeypatch, tmp_path):
+    monkeypatch.setattr(engines, "_catalog_path", lambda: str(tmp_path / "missing-products.csv"))
+
+
+@pytest.fixture
+def e(use_demo_catalog):
     return get_engines()
 
 
@@ -49,6 +56,13 @@ def test_sentiment_labels_and_negation():
     assert s.analyze("I absolutely love this, it is fantastic!")["label"] == "positive"
     assert s.analyze("Terrible quality, it broke in a day. Awful.")["label"] == "negative"
     assert s.analyze("This is not good at all")["label"] == "negative"      # negation handled
+
+
+def test_sentiment_analyzer_initialization_has_no_deprecation_warning():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", DeprecationWarning)
+        SentimentAnalyzer()
+    assert not [warning for warning in caught if issubclass(warning.category, DeprecationWarning)]
 
 
 def test_sentiment_summary_and_mismatch(e):

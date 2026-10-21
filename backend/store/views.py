@@ -27,7 +27,8 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_http_methods
  
-from .models import Cart, CartItem, Order, OrderItem, Payment, Product, User
+from .models import (Cart, CartItem, Order, OrderItem, Payment, Product, Review, ShopperActivity,
+                     User)
  
  
 # ═════════════════════════════════════════════════════════════════════════
@@ -79,19 +80,28 @@ def customer_required(view):
  
 # --- small serializers: model -> dict ---
 def product_json(p):
-    return {"id": p.id, "name": p.name, "description": p.description,
-            "price": str(p.price), "stock": p.stock, "is_deleted": p.is_deleted}
+    return {"id": p.id, "sku": p.sku, "name": p.name, "category": p.category, "brand": p.brand,
+            "description": p.description, "price": float(p.price), "stock": p.stock,
+            "image": p.image_path, "image_path": p.image_path, "is_active": p.is_active,
+            "is_deleted": p.is_deleted}
  
  
 def order_json(o):
+    try:
+        ship_to = json.loads(o.shipping_address)
+    except (TypeError, ValueError):
+        ship_to = None
     return {
-        "id": o.id, "status": o.status, "total_price": str(o.total_price),
-        "shipping_address": o.shipping_address, "created_at": o.created_at.isoformat(),
+        "id": o.id, "user": o.user.username, "status": o.status, "total_price": str(o.total_price),
+        "subtotal": str(o.subtotal), "discount": str(o.discount), "date": o.created_at.isoformat(),
+        "shipping_address": o.shipping_address, "ship_to": ship_to,
+        "created_at": o.created_at.isoformat(),
         "items": [{"product_id": i.product_id, "name": i.product_name,
                    "unit_price": str(i.unit_price), "quantity": i.quantity,
                    "line_total": str(i.line_total)} for i in o.items.all()],
         "payments": [{"transaction_id": p.transaction_id, "amount": str(p.amount),
-                      "method": p.method, "status": p.status} for p in o.payments.all()],
+                      "method": p.method, "status": p.status,
+                      "date": p.created_at.isoformat()} for p in o.payments.all()],
     }
  
  
@@ -122,17 +132,24 @@ def register(request):
         return error("Weak password.", password=list(exc.messages))
     except IntegrityError:
         return error("Username already taken.", 409)
+    user.first_name = str(data.get("full_name", "")).strip()
+    user.email = str(data.get("email", "")).strip()
+    user.phone = str(data.get("phone", "")).strip()
+    user.save(update_fields=["first_name", "email", "phone"])
     return JsonResponse({"id": user.id, "username": user.username, "role": user.role}, status=201)
  
  
 @require_http_methods(["POST"])
 def login_view(request):
-    data = read_json(request) or {}
+    data = read_json(request)
+    if data is None:
+        return error("Invalid JSON.")
     user = authenticate(request, username=data.get("username"), password=data.get("password"))
     if user is None:
         return error("Invalid credentials.", 401)
     login(request, user)
-    return JsonResponse({"id": user.id, "username": user.username, "role": user.role})
+    return JsonResponse({"id": user.id, "username": user.username, "role": user.role,
+                         "full_name": user.first_name, "email": user.email})
  
  
 @require_http_methods(["POST"])
@@ -151,7 +168,11 @@ def product_collection(request):
         qs = Product.objects.all()
         q = request.GET.get("q")
         if q:
-            qs = qs.filter(name__icontains=q)
+            from django.db.models import Q
+            qs = qs.filter(Q(name__icontains=q) | Q(category__icontains=q) | Q(description__icontains=q))
+        category = request.GET.get("category")
+        if category and category not in ("", "All"):
+            qs = qs.filter(category__iexact=category)
         return JsonResponse({"products": [product_json(p) for p in qs]})
     return _product_create(request)
  
@@ -162,8 +183,17 @@ def _product_create(request):
     if data is None:
         return error("Invalid JSON.")
     try:
-        product = Product(name=data.get("name", ""), description=data.get("description", ""),
-                          price=Decimal(str(data.get("price", ""))), stock=int(data.get("stock", 0)))
+        product_fields = {
+            "name": data.get("name", ""), "category": data.get("category", "General"),
+            "brand": data.get("brand", ""), "description": data.get("description", ""),
+            "price": Decimal(str(data.get("price", ""))), "stock": int(data.get("stock", 0)),
+            "image_path": data.get("image_path", data.get("image", "")),
+            "is_active": data.get("is_active", True),
+        }
+        sku = str(data.get("sku") or "").strip()
+        if sku:
+            product_fields["sku"] = sku
+        product = Product(**product_fields)
         product.full_clean()  # runs model validators (price >= 0.01, stock >= 0 ...)
         product.save()
     except (InvalidOperation, ValueError, TypeError):
@@ -198,13 +228,15 @@ def _product_update(request, pk):
         except Product.DoesNotExist:
             return error("Product not found.", 404)
         try:
-            for field in ("name", "description"):
+            for field in ("sku", "name", "category", "brand", "description", "image_path", "is_active"):
                 if field in data:
                     setattr(product, field, data[field])
             if "price" in data:
                 product.price = Decimal(str(data["price"]))
             if "stock" in data:
                 product.stock = int(data["stock"])
+            if "image" in data and "image_path" not in data:
+                product.image_path = data["image"]
             product.full_clean()
             product.save()
         except (InvalidOperation, ValueError, TypeError):
@@ -222,16 +254,263 @@ def _product_soft_delete(request, pk):
         return error("Product not found.", 404)
     product.delete()  # SOFT delete (see models.py)
     return JsonResponse({"detail": "Product soft-deleted."})
- 
- 
+
+
+def _ai_products():
+    return [{
+        "id": product.id, "name": product.name, "category": product.category,
+        "price": float(product.price), "stock": product.stock, "description": product.description,
+        "image": product.image_path,
+    } for product in Product.objects.all()]
+
+
+@require_http_methods(["GET"])
+def product_search(request):
+    from app.ai.smart_search import SmartSearch
+
+    try:
+        limit = min(max(int(request.GET.get("limit", 10)), 1), 50)
+    except ValueError:
+        return error("limit must be an integer.")
+    products = _ai_products()
+    if not products:
+        return JsonResponse({
+            "query": request.GET.get("q", ""),
+            "interpreted": {"text": request.GET.get("q", ""), "max_price": None, "min_price": None},
+            "did_you_mean": None, "results": [],
+        })
+    result = SmartSearch(products).search(
+        request.GET.get("q", ""), limit=limit, category=request.GET.get("category"),
+        in_stock_only=request.GET.get("in_stock") == "1",
+    )
+    return JsonResponse(result)
+
+
+@require_http_methods(["POST"])
+def product_recommendations(request):
+    from django.db.models import Avg
+    from app.ai.recommender import HybridRecommender
+
+    try:
+        limit = min(max(int(request.GET.get("k", 6)), 1), 20)
+    except ValueError:
+        return error("k must be an integer.")
+    activity = read_json(request)
+    if not isinstance(activity, dict):
+        return error("The request body must be a JSON object.")
+
+    products = _ai_products()
+    if not products:
+        return JsonResponse({"personalized": False, "items": []})
+    if request.user.is_authenticated and request.user.role == User.Role.CUSTOMER:
+        cart = Cart.objects.filter(user=request.user).first()
+        activity = {
+            "purchases": list(OrderItem.objects.filter(order__user=request.user)
+                              .exclude(order__status=Order.Status.CANCELLED)
+                              .values_list("product_id", flat=True)),
+            "cart": list(CartItem.objects.filter(cart=cart).values_list("product_id", flat=True))
+            if cart else [],
+            "views": list(ShopperActivity.objects.filter(
+                user=request.user, kind=ShopperActivity.Kind.VIEW, product__isnull=False,
+            ).values_list("product_id", flat=True)[:20]),
+            "searches": list(ShopperActivity.objects.filter(
+                user=request.user, kind=ShopperActivity.Kind.SEARCH,
+            ).values_list("query", flat=True)[:8]),
+            "liked": list(Review.objects.filter(user=request.user, rating__gte=4)
+                          .values_list("product_id", flat=True)),
+        }
+    ratings = {
+        row["product_id"]: float(row["average"])
+        for row in Review.objects.values("product_id").annotate(average=Avg("rating"))
+    }
+    interactions = []
+    for item in CartItem.objects.select_related("cart__user"):
+        interactions.extend([(item.cart.user.username, item.product_id, "cart")] * item.quantity)
+    for item in OrderItem.objects.select_related("order__user"):
+        interactions.extend([(item.order.user.username, item.product_id, "purchase")] * item.quantity)
+    for item in ShopperActivity.objects.filter(kind=ShopperActivity.Kind.VIEW, product__isnull=False):
+        interactions.append((item.user.username, item.product_id, "view"))
+    result = HybridRecommender(products, interactions, ratings).recommend(activity, k=limit)
+    return JsonResponse(result)
+
+
+@customer_required
+@require_http_methods(["GET", "POST", "DELETE"])
+def activity(request):
+    if request.method == "GET":
+        searches = []
+        seen_queries = set()
+        for row in ShopperActivity.objects.filter(user=request.user, kind=ShopperActivity.Kind.SEARCH)[:100]:
+            key = row.query.casefold()
+            if key not in seen_queries:
+                searches.append({"q": row.query, "ts": row.created_at.strftime("%Y-%m-%d %H:%M")})
+                seen_queries.add(key)
+            if len(searches) == 15:
+                break
+        views = []
+        seen_products = set()
+        for product_id in ShopperActivity.objects.filter(
+            user=request.user, kind=ShopperActivity.Kind.VIEW, product__isnull=False,
+        ).values_list("product_id", flat=True)[:100]:
+            if product_id not in seen_products:
+                views.append(product_id)
+                seen_products.add(product_id)
+            if len(views) == 20:
+                break
+        return JsonResponse({"searches": searches, "views": views})
+    if request.method == "DELETE":
+        kind = request.GET.get("kind", ShopperActivity.Kind.SEARCH)
+        if kind not in ShopperActivity.Kind.values:
+            return error("kind must be search or view.")
+        rows = ShopperActivity.objects.filter(user=request.user, kind=kind)
+        query = request.GET.get("q")
+        if query is not None:
+            rows = rows.filter(query__iexact=query)
+        deleted, _ = rows.delete()
+        return JsonResponse({"deleted": deleted})
+
+    data = read_json(request)
+    if not isinstance(data, dict):
+        return error("Invalid JSON.")
+    kind = data.get("kind")
+    if kind == ShopperActivity.Kind.SEARCH:
+        query = str(data.get("query", "")).strip()
+        if not query:
+            return error("query is required for a search activity.")
+        ShopperActivity.objects.create(user=request.user, kind=kind, query=query[:250])
+    elif kind == ShopperActivity.Kind.VIEW:
+        try:
+            product = Product.objects.get(pk=data.get("product_id"))
+        except (Product.DoesNotExist, ValueError, TypeError):
+            return error("Product not found.", 404)
+        ShopperActivity.objects.create(user=request.user, kind=kind, product=product)
+    else:
+        return error("kind must be search or view.")
+    return JsonResponse({"detail": "Activity saved."}, status=201)
+
+
+def review_json(review):
+    return {
+        "id": review.id, "pid": review.product_id, "product_id": review.product_id,
+        "user": review.user.username, "rating": review.rating, "title": review.title,
+        "text": review.text, "date": review.created_at.date().isoformat(),
+        "verified": review.verified,
+    }
+
+
+@admin_required
+@require_http_methods(["GET"])
+def review_collection(request):
+    reviews = Review.objects.select_related("product", "user")
+    return JsonResponse({"reviews": [review_json(review) for review in reviews]})
+
+
+@require_http_methods(["GET", "POST"])
+def product_reviews(request, product_id):
+    try:
+        product = Product.objects.get(pk=product_id)
+    except Product.DoesNotExist:
+        return error("Product not found.", 404)
+    if request.method == "GET":
+        from django.db.models import Avg
+        reviews = list(Review.objects.filter(product=product).select_related("user"))
+        rows = [{"rating": review.rating, "text": f"{review.title}. {review.text}".strip(". ")}
+                for review in reviews]
+        from app.ai.sentiment import SentimentAnalyzer
+        summary = SentimentAnalyzer().summarize(rows, product.name)
+        return JsonResponse({"reviews": [review_json(r) for r in reviews], "summary": summary,
+                             "count": len(reviews),
+                             "avg_rating": float(Review.objects.filter(product=product).aggregate(
+                                 average=Avg("rating"))["average"] or 0),
+                             "hist": {rating: Review.objects.filter(product=product, rating=rating).count()
+                                      for rating in range(1, 6)}})
+    if not request.user.is_authenticated:
+        return error("Authentication required.", 401)
+    if request.user.role != User.Role.CUSTOMER:
+        return error("Customer account required.", 403)
+    data = read_json(request)
+    if not isinstance(data, dict):
+        return error("Invalid JSON.")
+    try:
+        rating = int(data.get("rating"))
+    except (TypeError, ValueError):
+        return error("rating must be an integer from 1 to 5.")
+    if not 1 <= rating <= 5:
+        return error("rating must be an integer from 1 to 5.")
+    title, text = str(data.get("title", "")).strip(), str(data.get("text", "")).strip()
+    if not title and not text:
+        return error("Please add a headline or a written review.")
+    verified = OrderItem.objects.filter(
+        order__user=request.user, product=product, order__status=Order.Status.DELIVERED,
+    ).exists()
+    review, _ = Review.objects.update_or_create(
+        product=product, user=request.user,
+        defaults={"rating": rating, "title": title, "text": text, "verified": verified},
+    )
+    return JsonResponse(review_json(review))
+
+
+@admin_required
+@require_http_methods(["DELETE"])
+def review_delete(request, review_id):
+    deleted, _ = Review.objects.filter(pk=review_id).delete()
+    if not deleted:
+        return error("Review not found.", 404)
+    return JsonResponse({"detail": "Review deleted."})
+
+
+@require_http_methods(["GET"])
+def review_sentiment(request, product_id):
+    from app.ai.sentiment import SentimentAnalyzer
+
+    try:
+        product = Product.objects.get(pk=product_id)
+    except Product.DoesNotExist:
+        return error("Product not found.", 404)
+    reviews = Review.objects.filter(product=product)
+    data = [{"rating": review.rating, "text": f"{review.title}. {review.text}".strip(". ")}
+            for review in reviews]
+    return JsonResponse({"product": product.name, **SentimentAnalyzer().summarize(data, product.name)})
+
+
+@login_required_api
+@require_http_methods(["GET", "PATCH"])
+def profile(request):
+    user = request.user
+    if request.method == "GET":
+        return JsonResponse({
+            "full_name": user.first_name, "email": user.email, "phone": user.phone,
+            "alt_phone": user.alt_phone, "address_line1": user.address_line1,
+            "address_line2": user.address_line2, "city": user.city, "state": user.state,
+            "postal_code": user.postal_code, "country": user.country,
+            "address_type": user.address_type, "delivery_notes": user.delivery_notes,
+        })
+    data = read_json(request)
+    if not isinstance(data, dict):
+        return error("Invalid JSON.")
+    fields = {
+        "full_name": "first_name", "email": "email", "phone": "phone", "alt_phone": "alt_phone",
+        "address_line1": "address_line1", "address_line2": "address_line2", "city": "city",
+        "state": "state", "postal_code": "postal_code", "country": "country",
+        "address_type": "address_type", "delivery_notes": "delivery_notes",
+    }
+    for source, target in fields.items():
+        if source in data:
+            setattr(user, target, str(data[source]).strip())
+    if user.address_type not in {"Home", "Work"}:
+        return error("address_type must be Home or Work.")
+    user.save(update_fields=list(fields.values()))
+    return JsonResponse({"detail": "Profile saved."})
+
+
 # ═════════════════════════════════════════════════════════════════════════
 # D. CART
 # ═════════════════════════════════════════════════════════════════════════
 def cart_json(cart):
     items = cart.items.select_related("product")
-    return {"items": [{"product_id": i.product_id, "name": i.product.name,
-                       "unit_price": str(i.product.price), "quantity": i.quantity,
-                       "line_total": str(i.line_total)} for i in items],
+    return {"items": [{"product_id": i.product_id, "product": product_json(i.product),
+                       "name": i.product.name, "unit_price": str(i.product.price),
+                       "quantity": i.quantity, "line_total": str(i.line_total)} for i in items],
             "total": str(cart.total)}
  
  
@@ -277,6 +556,31 @@ def cart_remove(request):
     cart, _ = Cart.objects.get_or_create(user=request.user)
     CartItem.objects.filter(cart=cart, product_id=data.get("product_id")).delete()
     return JsonResponse(cart_json(cart))
+
+
+@customer_required
+@require_http_methods(["POST"])
+def cart_update(request):
+    data = read_json(request)
+    if data is None:
+        return error("Invalid JSON.")
+    try:
+        quantity = int(data.get("quantity", 0))
+        product_id = int(data.get("product_id"))
+    except (TypeError, ValueError):
+        return error("product_id and quantity must be integers.")
+    cart = Cart.objects.filter(user=request.user).first()
+    item = CartItem.objects.filter(cart=cart, product_id=product_id).first() if cart else None
+    if item is None:
+        return error("Cart item not found.", 404)
+    if quantity < 1:
+        item.delete()
+    elif quantity > item.product.stock:
+        return error(f"Only {item.product.stock} in stock.", 409)
+    else:
+        item.quantity = quantity
+        item.save(update_fields=["quantity"])
+    return JsonResponse(cart_json(cart))
  
  
 # ═════════════════════════════════════════════════════════════════════════
@@ -289,7 +593,7 @@ class CheckoutError(Exception):
         super().__init__("; ".join(self.messages))
  
  
-def place_order(user, shipping_address="", payment_method="COD"):
+def place_order(user, shipping_address="", payment_method="COD", coupon=""):
     """
     THE PROBLEM (race condition):
         Only 1 phone left. Alice and Bob click "Buy" in the same millisecond.
@@ -335,17 +639,24 @@ def place_order(user, shipping_address="", payment_method="COD"):
         # Step 4: create the order, snapshot the prices, deduct stock.
         order = Order.objects.create(user=user, total_price=Decimal("0.00"),
                                      shipping_address=shipping_address, status=Order.Status.PENDING)
-        total = Decimal("0.00")
+        subtotal = Decimal("0.00")
         for item in items:
             product = locked[item.product_id]
             OrderItem.objects.create(order=order, product=product, product_name=product.name,
                                      unit_price=product.price, quantity=item.quantity)
             product.stock -= item.quantity          # safe: we hold the lock
             product.save(update_fields=["stock", "updated_at"])
-            total += product.price * item.quantity
- 
+            subtotal += product.price * item.quantity
+
+        code = str(coupon or "").strip().upper()
+        if code and code != "SAVE10":
+            raise CheckoutError("Invalid coupon code.")
+        discount = (subtotal * Decimal("0.10")).quantize(Decimal("0.01")) if code else Decimal("0.00")
+        total = subtotal - discount
+        order.subtotal = subtotal
+        order.discount = discount
         order.total_price = total
-        order.save(update_fields=["total_price", "updated_at"])
+        order.save(update_fields=["subtotal", "discount", "total_price", "updated_at"])
  
         # Step 5: payment record (INITIATED until the gateway confirms) + empty the cart.
         Payment.objects.create(order=order, amount=total, method=payment_method)
@@ -358,9 +669,19 @@ def place_order(user, shipping_address="", payment_method="COD"):
 @require_http_methods(["POST"])
 def checkout(request):
     """Body (optional): {"shipping_address": "...", "payment_method": "UPI"}"""
-    data = read_json(request) or {}
+    data = read_json(request)
+    if data is None:
+        return error("Invalid JSON.")
     try:
-        order = place_order(request.user, data.get("shipping_address", ""), data.get("payment_method", "COD"))
+        address = data.get("shipping_address") or json.dumps({
+            "full_name": request.user.first_name, "email": request.user.email,
+            "phone": request.user.phone, "alt_phone": request.user.alt_phone,
+            "address_line1": request.user.address_line1, "address_line2": request.user.address_line2,
+            "city": request.user.city, "state": request.user.state,
+            "postal_code": request.user.postal_code, "country": request.user.country,
+            "address_type": request.user.address_type, "delivery_notes": request.user.delivery_notes,
+        })
+        order = place_order(request.user, address, data.get("payment_method", "COD"), data.get("coupon", ""))
     except CheckoutError as exc:
         return error("Checkout failed.", 409, reasons=exc.messages)
     return JsonResponse(order_json(order), status=201)
@@ -418,8 +739,32 @@ def order_detail(request, pk):
         return JsonResponse(order_json(qs.get(pk=pk)))
     except Order.DoesNotExist:
         return error("Order not found.", 404)
- 
- 
+
+
+@customer_required
+@require_http_methods(["POST"])
+def order_cancel(request, pk):
+    with transaction.atomic():
+        try:
+            order = Order.objects.select_for_update().get(pk=pk, user=request.user)
+        except Order.DoesNotExist:
+            return error("Order not found.", 404)
+        if not order.can_move_to(Order.Status.CANCELLED):
+            return error(f"Cannot cancel an order in {order.status} status.", 409)
+        items = list(order.items.all())
+        locked = {
+            product.pk: product
+            for product in Product.all_objects.select_for_update()
+            .filter(pk__in=sorted(item.product_id for item in items)).order_by("pk")
+        }
+        for item in items:
+            locked[item.product_id].stock += item.quantity
+            locked[item.product_id].save(update_fields=["stock", "updated_at"])
+        order.status = Order.Status.CANCELLED
+        order.save(update_fields=["status", "updated_at"])
+    return JsonResponse(order_json(order))
+
+
 @admin_required
 @require_http_methods(["PATCH"])
 def order_update_status(request, pk):

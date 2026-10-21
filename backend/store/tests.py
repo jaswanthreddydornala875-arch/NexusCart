@@ -160,6 +160,107 @@ class AdminSiteTests(TestCase):
         p2 = Product.objects.create(name="B", price=Decimal("1"), stock=1)
         c.post("/admin/store/product/", {"action": "soft_delete_selected", "_selected_action": [p2.pk]})
         self.assertTrue(Product.all_objects.get(pk=p2.pk).is_deleted)
+
+
+class IntegratedAPIFlowsTests(TestCase):
+    def setUp(self):
+        self.customer = User.objects.create_user("shopper", "Strong!Pass123")
+        self.product = Product.objects.create(
+            name="Wireless Mouse", category="Electronics", price=Decimal("20.00"), stock=10,
+        )
+        self.related = Product.objects.create(
+            name="Wireless Keyboard", category="Electronics", price=Decimal("30.00"), stock=5,
+        )
+        self.client = Client(enforce_csrf_checks=False)
+        self.client.force_login(self.customer)
+
+    def test_ai_profile_review_cart_checkout_and_cancel_integrate(self):
+        profile = {
+            "full_name": "Shopper Example", "email": "shopper@example.com", "phone": "1234567890",
+            "address_line1": "1 Market Street", "city": "Chennai", "state": "Tamil Nadu",
+            "postal_code": "600001", "country": "India", "address_type": "Home",
+        }
+        self.assertEqual(
+            self.client.patch("/api/profile/", profile, content_type="application/json").status_code, 200,
+        )
+
+        search = self.client.get("/api/products/search/", {"q": "wireles mouse"})
+        self.assertEqual(search.status_code, 200)
+        self.assertEqual(search.json()["results"][0]["product"]["id"], self.product.id)
+
+        recommendations = self.client.post(
+            "/api/recommendations/?k=3", {"views": [self.product.id]}, content_type="application/json",
+        )
+        self.assertEqual(recommendations.status_code, 200)
+        self.assertTrue(recommendations.json()["items"])
+
+        self.assertEqual(
+            self.client.post("/api/activity/", {"kind": "search", "query": "wireless mouse"},
+                             content_type="application/json").status_code, 201,
+        )
+        self.assertEqual(
+            self.client.post("/api/activity/", {"kind": "view", "product_id": self.product.id},
+                             content_type="application/json").status_code, 201,
+        )
+        activity = self.client.get("/api/activity/").json()
+        self.assertEqual(activity["searches"][0]["q"], "wireless mouse")
+        self.assertEqual(activity["views"], [self.product.id])
+
+        review = self.client.post(
+            f"/api/products/{self.product.id}/reviews/",
+            {"rating": 5, "title": "Great", "text": "Works perfectly."},
+            content_type="application/json",
+        )
+        self.assertEqual(review.status_code, 200)
+        self.assertEqual(review.json()["user"], self.customer.username)
+        self.assertEqual(self.client.get(f"/api/products/{self.product.id}/sentiment/").json()["count"], 1)
+
+        self.assertEqual(
+            self.client.post("/api/cart/add/", {"product_id": self.product.id, "quantity": 3},
+                             content_type="application/json").status_code, 200,
+        )
+        updated_cart = self.client.post(
+            "/api/cart/update/", {"product_id": self.product.id, "quantity": 2},
+            content_type="application/json",
+        )
+        self.assertEqual(updated_cart.json()["items"][0]["quantity"], 2)
+
+        checkout = self.client.post(
+            "/api/checkout/", {"coupon": "SAVE10", "payment_method": "Cash on Delivery"},
+            content_type="application/json",
+        )
+        self.assertEqual(checkout.status_code, 201)
+        self.assertEqual(checkout.json()["subtotal"], "40.00")
+        self.assertEqual(checkout.json()["discount"], "4.00")
+        self.assertEqual(checkout.json()["total_price"], "36.00")
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock, 8)
+
+        cancelled = self.client.post(f"/api/orders/{checkout.json()['id']}/cancel/")
+        self.assertEqual(cancelled.status_code, 200)
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock, 10)
+
+    def test_customer_auth_and_admin_product_api(self):
+        self.assertEqual(self.client.get("/api/cart/").status_code, 200)
+        self.assertEqual(self.client.post(
+            "/api/products/", {"name": "Unauthorized", "price": "5", "stock": 2},
+            content_type="application/json",
+        ).status_code, 403)
+
+        admin = User.objects.create_user("catalog-admin", "Strong!Pass123", role=User.Role.ADMIN)
+        admin_client = Client(enforce_csrf_checks=False)
+        admin_client.force_login(admin)
+        created = admin_client.post(
+            "/api/products/",
+            {"sku": "ACC-1", "name": "Canvas Tote", "category": "Accessories",
+             "price": "12.50", "stock": 3},
+            content_type="application/json",
+        )
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.json()["sku"], "ACC-1")
+        self.assertIn("Accessories", [p["category"] for p in
+                                     admin_client.get("/api/products/").json()["products"]])
  
  
 @skipUnlessDBFeature("has_select_for_update")

@@ -6,7 +6,7 @@ Run from the project root:  python frontend/main.py
 Project location:
     frontend/main.py      Tkinter application
     frontend/theme.py     shared theme and styles
-    frontend/api_client.py REST API helper for the Flask backend
+    frontend/api_client.py REST client for the Django backend
     frontend/assets/images/ product images grouped by category
 
 Optional:  pip install pillow      (enables JPG/WEBP images and smoother resizing)
@@ -21,16 +21,14 @@ WHAT'S IN IT
   * Admin: products (with images), orders, review moderation, reports
 
 DATA
-  The GUI loads products from database/products.csv when it contains product rows.
-  If the CSV is empty, it uses the built-in demo catalog. The current UI store is
-  still in-memory; api_client.py contains the REST client for backend integration.
+  By default the GUI uses an in-memory demo store. Set NEXUSCART_API_URL to use
+  the persistent Django API for accounts, catalog, cart, checkout and orders.
 
 Demo logins:  admin / admin123  (admin)      alice / alice123  (customer)
 Demo coupon:  SAVE10  (10% off)
 """
 import csv
 import hashlib
-import importlib
 import os
 import shutil
 import random
@@ -59,8 +57,12 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 CARD_W = 220
 CARD_IMG, DETAIL_IMG, THUMB_IMG, SMALL_IMG = 150, 300, 100, 60
 
-sys.path.insert(0, os.path.join(PROJECT_DIR, "backend", "app", "ai"))
-SmartSearch = importlib.import_module("smart_search").SmartSearch
+sys.path.insert(0, os.path.join(PROJECT_DIR, "backend"))
+from app.ai.assistant import ShoppingAssistant
+from app.ai.fraud_detection import fraud_lines, scan_orders
+from app.ai.forecasting import forecast_demand, forecast_lines
+from app.ai.sentiment import SentimentAnalyzer
+from app.ai.smart_search import SmartSearch
 
 from theme import (NAVY, NAVY_2, BG, SURFACE, TEXT, MUTED, LINK, LINK_HOVER, LINE, HOVER,
                    HEAD_BG, PRICE, RED, GREEN, WARN, STAR, YELLOW, YELLOW_H, ORANGE, ORANGE_H,
@@ -701,7 +703,7 @@ class MockStore:
             by_method[o["payment"]] = by_method.get(o["payment"], 0) + o["total"]
             for name, _, qty, _ in o["items"]:
                 sold[name] = sold.get(name, 0) + qty
-        return {
+        report = {
             "orders": len(self.orders),
             "revenue": sum(o["total"] for o in valid),
             "by_status": by_status,
@@ -710,6 +712,382 @@ class MockStore:
             "low_stock": [p for p in self.products.values() if p["stock"] <= 10],
             "reviews": len(self.reviews),
         }
+        report["fraud_risks"] = scan_orders(self.orders, self.payments)
+        report["forecast"] = forecast_demand(self.orders, list(self.products.values()))
+        return report
+
+    def smart_search(self, query):
+        result = SmartSearch(list(self.products.values())).search(query, limit=50)
+        products = [row["product"] for row in result["results"]]
+        return {
+            "products": products,
+            "partial": False,
+            "strong": True,
+            "corrected": result["did_you_mean"],
+            "filters": [],
+        }
+
+    def review_insights(self, product_id):
+        product = self.products.get(product_id, {})
+        reviews = [review for review in self.reviews if review["pid"] == product_id]
+        summary = SentimentAnalyzer().summarize(
+            [{"rating": review["rating"], "text": f"{review['title']}. {review['text']}".strip(". ")}
+             for review in reviews],
+            product.get("name", ""),
+        )
+        insights = [item["text"] for item in summary["praise"] + summary["complaints"]]
+        return {"count": summary["count"], "summary": "; ".join(insights)}
+
+class DjangoStore(MockStore):
+    """Persist commerce operations through the Django API while reusing the UI's data shapes."""
+
+    backend_enabled = True
+
+    def __init__(self):
+        self.api = APIClient()
+        self.current_username = None
+        self.users = {}
+        self.products = {}
+        self.carts = {}
+        self.orders = []
+        self.payments = []
+        self.reviews = []
+        self.history = {}
+        self.views = {}
+        self.coupons = {"SAVE10": 0.10}
+        self._pid, self._oid, self._rid = 1, 1001, 1
+        self._review_cache = {}
+
+    def _call(self, operation, *args, **kwargs):
+        try:
+            return operation(*args, **kwargs)
+        except APIError as exc:
+            raise StoreError(str(exc)) from exc
+
+    @staticmethod
+    def _product(data):
+        product = dict(data)
+        product["price"] = float(product["price"])
+        product["image"] = product.get("image_path") or product.get("image", "")
+        return product
+
+    def _sync_products(self):
+        result = self._call(self.api.list_products)
+        self.products = {p["id"]: self._product(p) for p in result["products"]}
+        self._pid = max(self.products, default=0) + 1
+
+    def _order(self, data):
+        status = {
+            "PENDING": "Pending", "PROCESSING": "Paid", "SHIPPED": "Shipped",
+            "DELIVERED": "Delivered", "CANCELLED": "Cancelled",
+        }.get(data["status"], data["status"].title())
+        payment = data.get("payments", [{}])[0]
+        payments = []
+        for item in data.get("payments", []):
+            payment_status = {
+                "INITIATED": "Initiated", "SUCCESS": "Success",
+                "FAILED": "Failed", "REFUNDED": "Refunded",
+            }.get(item.get("status"), item.get("status", "").title())
+            payment_date = str(item.get("date", data.get("date", "")))
+            try:
+                payment_date = datetime.fromisoformat(
+                    payment_date.replace("Z", "+00:00")
+                ).strftime("%Y-%m-%d %H:%M")
+            except ValueError:
+                pass
+            payments.append({
+                "order_id": data["id"], "method": item.get("method", ""),
+                "amount": float(item.get("amount", 0)), "status": payment_status,
+                "date": payment_date,
+            })
+        order_date = str(data.get("date", ""))
+        try:
+            order_date = datetime.fromisoformat(order_date.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            pass
+        items = [(item["name"], float(item["unit_price"]), item["quantity"], item["product_id"])
+                 for item in data.get("items", [])]
+        return {
+            "id": data["id"], "user": data.get("user", self.current_username or ""),
+            "date": order_date, "items": items,
+            "subtotal": float(data.get("subtotal", data["total_price"])),
+            "discount": float(data.get("discount", 0)), "total": float(data["total_price"]),
+            "status": status, "payment": payment.get("method", ""),
+            "payments": payments,
+            "ship_to": data.get("ship_to") or (
+                self.users.get(self.current_username, {}).get("profile", {}) if self.current_username else {}
+            ),
+        }
+
+    def login(self, username, password):
+        result = self._call(self.api.login, username.strip(), password)
+        self.current_username = result["username"]
+        role = "admin" if result["role"] == "ADMIN" else "customer"
+        self.users.setdefault(self.current_username, {
+            "username": self.current_username, "role": role,
+            "profile": {key: "" for key in PROFILE_KEYS},
+        })
+        self.users[self.current_username]["role"] = role
+        self.reviews = []
+        self._review_cache.clear()
+        self._sync_products()
+        self.get_profile(self.current_username)
+        if role == "customer":
+            self.cart_items(self.current_username)
+            activity = self._call(self.api.get_activity)
+            self.history[self.current_username] = activity["searches"]
+            self.views[self.current_username] = activity["views"]
+        self.list_orders(self.current_username if role != "admin" else None)
+        return {"username": self.current_username, "role": role}
+
+    def logout(self):
+        self._call(self.api.post, "auth/logout/", {})
+        self.current_username = None
+
+    def username_taken(self, username):
+        return False
+
+    def register(self, username, password, role="customer", full_name="", email="", phone=""):
+        self._call(self.api.register, username.strip(), password, full_name, email, phone)
+
+    def get_profile(self, username):
+        if username != self.current_username:
+            return {key: "" for key in PROFILE_KEYS}
+        profile = self._call(self.api.get_profile)
+        profile.setdefault("address_type", "Home")
+        if username in self.users:
+            self.users[username]["profile"] = profile
+        return profile
+
+    def profile_complete(self, username):
+        profile = self.get_profile(username)
+        return all(profile.get(key, "").strip() for key in REQUIRED_PROFILE)
+
+    def save_profile(self, username, data):
+        self._call(self.api.save_profile, data)
+        if username in self.users:
+            self.users[username]["profile"] = dict(data)
+
+    def record_search(self, username, query):
+        super().record_search(username, query)
+        if query.strip():
+            self._call(self.api.record_activity, "search", query=query.strip())
+
+    def remove_search(self, username, query):
+        self._call(self.api.clear_activity, "search", query)
+        super().remove_search(username, query)
+
+    def clear_search_history(self, username):
+        self._call(self.api.clear_activity, "search")
+        super().clear_search_history(username)
+
+    def record_view(self, username, pid):
+        super().record_view(username, pid)
+        self._call(self.api.record_activity, "view", product_id=pid)
+
+    def categories(self):
+        return sorted({product["category"] for product in self.products.values()})
+
+    def list_products(self, search="", category="All", sort="Featured"):
+        params = {"search": search or None, "category": category if category != "All" else None}
+        result = self._call(self.api.list_products, **params)
+        products = [self._product(product) for product in result["products"]]
+        self.products.update({product["id"]: product for product in products})
+        if sort == "Price: Low to High":
+            products.sort(key=lambda product: product["price"])
+        elif sort == "Price: High to Low":
+            products.sort(key=lambda product: -product["price"])
+        elif sort == "Avg. Customer Review":
+            products.sort(key=lambda product: -self.rating_summary(product["id"])["avg"])
+        return products
+
+    def smart_search(self, query):
+        result = self._call(self.api.search_products, query, limit=50)
+        return {
+            "products": [item["product"] for item in result["results"]],
+            "partial": False,
+            "strong": True,
+            "corrected": result.get("did_you_mean"),
+            "filters": [],
+        }
+
+    def recommendations(self, username, limit=6):
+        result = self._call(self.api.recommend_products, {}, limit)
+        items = [(item["product"], item["reason"]) for item in result.get("items", [])]
+        return items, result.get("personalized", False)
+
+    def add_product(self, name, category, price, stock, description="", image=""):
+        payload = {"name": name, "category": category, "price": price, "stock": stock,
+                   "description": description, "image_path": image}
+        product = self._product(self._call(self.api.create_product, payload))
+        self.products[product["id"]] = product
+        return product["id"]
+
+    def update_product(self, pid, name, category, price, stock, description="", image=""):
+        payload = {"name": name, "category": category, "price": price, "stock": stock,
+                   "description": description, "image_path": image}
+        product = self._product(self._call(self.api.update_product, pid, payload))
+        self.products[product["id"]] = product
+
+    def upsert_product_from_csv(self, row, image_folder=""):
+        sku = row.get("sku", "").strip()
+        product_id = row.get("product_id", "").strip()
+        existing = next((product for product in self.products.values()
+                         if (sku and product.get("sku") == sku)
+                         or (product_id and str(product["id"]) == product_id)
+                         or product["name"].casefold() == row["name"].strip().casefold()), None)
+        local_pid, action = super().upsert_product_from_csv(row, image_folder)
+        local_product = self.products.pop(local_pid)
+        image_path = local_product.get("image", "")
+        if image_path:
+            try:
+                image_path = os.path.relpath(image_path, PROJECT_DIR)
+            except ValueError:
+                pass
+        payload = {
+            "sku": sku, "name": local_product["name"], "category": local_product["category"],
+            "price": local_product["price"], "stock": local_product["stock"],
+            "description": local_product["description"], "image_path": image_path,
+        }
+        if existing:
+            payload.pop("sku", None)
+            if sku:
+                payload["sku"] = sku
+            result = self._product(self._call(self.api.update_product, existing["id"], payload))
+            self.products[result["id"]] = result
+            return result["id"], "updated"
+        product = self._product(self._call(self.api.create_product, payload))
+        self.products[product["id"]] = product
+        return product["id"], action
+
+    def save_catalog_csv(self):
+        return None
+
+    def delete_product(self, pid):
+        self._call(self.api.delete_product, pid)
+        self.products.pop(pid, None)
+
+    def rating_summary(self, pid):
+        result = self._reviews(pid)
+        return {"avg": result["avg_rating"], "count": result["count"],
+                "hist": {int(rating): count for rating, count in result["hist"].items()}}
+
+    def _reviews(self, pid):
+        if pid not in self._review_cache:
+            self._review_cache[pid] = self._call(self.api.product_reviews, pid)
+        return self._review_cache[pid]
+
+    def review_insights(self, product_id):
+        result = self._call(self.api.review_sentiment, product_id)
+        summary = result
+        insights = [item["text"] for item in summary.get("praise", []) + summary.get("complaints", [])]
+        return {"count": summary.get("count", 0), "summary": "; ".join(insights)}
+
+    def list_reviews(self, pid):
+        return self._reviews(pid)["reviews"]
+
+    def list_all_reviews(self):
+        self.reviews = self._call(self.api.get, "reviews/")["reviews"]
+        return self.reviews
+
+    def get_user_review(self, username, pid):
+        return next((review for review in self.list_reviews(pid) if review["user"] == username), None)
+
+    def has_purchased(self, username, pid):
+        return any(order["user"] == username and order["status"] == "Delivered"
+                   and any(item[3] == pid for item in order["items"])
+                   for order in self.list_orders(username))
+
+    def add_review(self, username, pid, rating, title, text):
+        self._call(self.api.save_review, pid, rating, title, text)
+        self._review_cache.pop(pid, None)
+
+    def delete_review(self, rid):
+        self._call(self.api.delete_review, rid)
+        self.reviews = [review for review in self.reviews if review["id"] != rid]
+        self._review_cache.clear()
+
+    def cart_items(self, username):
+        data = self._call(self.api.cart)
+        items = []
+        for item in data["items"]:
+            product = self.products.get(item["product_id"]) or self._product(item["product"])
+            self.products[product["id"]] = product
+            items.append((product, item["quantity"]))
+        return items
+
+    def cart_count(self, username):
+        return sum(quantity for _, quantity in self.cart_items(username))
+
+    def cart_add(self, username, pid, qty):
+        self._call(self.api.add_cart_item, pid, qty)
+
+    def cart_set_qty(self, username, pid, qty):
+        self._call(self.api.update_cart_item, pid, qty)
+
+    def cart_remove(self, username, pid):
+        self._call(self.api.remove_cart_item, pid)
+
+    def coupon_rate(self, code):
+        if code.strip().upper() != "SAVE10":
+            raise StoreError("Invalid coupon code.")
+        return 0.10
+
+    def checkout(self, username, coupon="", payment_method="Cash on Delivery"):
+        if not self.profile_complete(username):
+            raise StoreError("Please add your delivery details (Account) before placing an order.")
+        result = self._call(self.api.checkout, coupon, payment_method)
+        if payment_method != "Cash on Delivery" and result.get("payments"):
+            transaction_id = result["payments"][0]["transaction_id"]
+            self._call(self.api.post, "payments/confirm/",
+                       {"transaction_id": transaction_id, "success": True})
+            result = next(order for order in self._call(self.api.orders) if order["id"] == result["id"])
+        self._sync_products()
+        self.orders = [self._order(order) for order in self._call(self.api.orders)]
+        self.cart_items(username)
+        return self._order(result)
+
+    def list_orders(self, username=None):
+        orders = [self._order(order) for order in self._call(self.api.orders)]
+        if username:
+            orders = [order for order in orders if order["user"] == username]
+        self.orders = orders
+        return orders
+
+    def set_status(self, oid, status):
+        backend_status = {"Paid": "PROCESSING"}.get(status, status.upper())
+        self._call(self.api.set_order_status, oid, backend_status)
+        self.list_orders(None if self.users.get(self.current_username, {}).get("role") == "admin"
+                         else self.current_username)
+        self._sync_products()
+
+    def cancel_order(self, username, oid):
+        self._call(self.api.cancel_order, oid)
+        self.list_orders(username)
+        self._sync_products()
+
+    def report(self):
+        orders = self.list_orders(None)
+        reviews = self.list_all_reviews()
+        by_status = {status: sum(order["status"] == status for order in orders)
+                     for status in ORDER_STATUSES}
+        by_method, sold = {}, {}
+        valid = [order for order in orders if order["status"] != "Cancelled"]
+        for order in valid:
+            by_method[order["payment"]] = by_method.get(order["payment"], 0) + order["total"]
+            for name, _, quantity, _ in order["items"]:
+                sold[name] = sold.get(name, 0) + quantity
+        report = {
+            "orders": len(orders), "revenue": sum(order["total"] for order in valid),
+            "by_status": by_status, "by_method": by_method,
+            "top": sorted(sold.items(), key=lambda item: item[1], reverse=True)[:5],
+            "low_stock": [product for product in self.products.values() if product["stock"] <= 10],
+            "reviews": len(reviews),
+        }
+        payments = [payment for order in orders for payment in order["payments"]]
+        report["fraud_risks"] = scan_orders(orders, payments)
+        report["forecast"] = forecast_demand(orders, list(self.products.values()))
+        return report
 
 
 # ----------------------------------------------------------------------------
@@ -1066,8 +1444,9 @@ class LoginFrame(tk.Frame):
         tk.Label(card, text="New to NexusCart?", font=(FONT, 9), bg=SURFACE, fg=MUTED).pack()
         ttk.Button(card, text="Create your account", style="Secondary.TButton",
                    command=on_register).pack(fill="x", pady=(6, 0))
-        tk.Label(outer, text="Demo: admin/admin123  or  alice/alice123", font=(FONT, 9),
-                 bg=BG, fg=MUTED).pack(pady=12)
+        if not getattr(store, "backend_enabled", False):
+            tk.Label(outer, text="Demo: admin/admin123  or  alice/alice123", font=(FONT, 9),
+                     bg=BG, fg=MUTED).pack(pady=12)
         self.fu.widget.focus_set()
 
     def login(self):
@@ -1279,13 +1658,78 @@ class OnboardingScreen(tk.Frame):
 # ----------------------------------------------------------------------------
 # Customer pages
 # ----------------------------------------------------------------------------
+class AssistantPage(tk.Frame):
+    def __init__(self, master, screen):
+        super().__init__(master, bg=BG)
+        self.screen = screen
+        self.assistant = ShoppingAssistant(
+            screen.store, screen.user["username"], currency=CURRENCY,
+        )
+        tk.Label(self, text="Shopping Assistant", font=(HEAD, 18, "bold"), bg=BG, fg=TEXT).pack(
+            anchor="w", padx=22, pady=(16, 4))
+        tk.Label(self, text="Ask about products, recommendations, your orders, cart, or store policies.",
+                 font=(FONT, 10), bg=BG, fg=MUTED).pack(anchor="w", padx=22, pady=(0, 10))
+
+        chat = tk.Frame(self, bg=SURFACE, highlightthickness=1, highlightbackground=LINE)
+        chat.pack(fill="both", expand=True, padx=18, pady=(0, 10))
+        self.transcript = tk.Text(chat, wrap="word", state="disabled", font=(FONT, 10),
+                                  bg=SURFACE, fg=TEXT, padx=14, pady=12, relief="flat")
+        scrollbar = ttk.Scrollbar(chat, orient="vertical", command=self.transcript.yview)
+        self.transcript.configure(yscrollcommand=scrollbar.set)
+        self.transcript.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        self.suggestions = tk.Frame(self, bg=BG)
+        self.suggestions.pack(fill="x", padx=18, pady=(0, 8))
+        bottom = tk.Frame(self, bg=BG)
+        bottom.pack(fill="x", padx=18, pady=(0, 16))
+        self.message = tk.StringVar()
+        self.entry = ttk.Entry(bottom, textvariable=self.message)
+        self.entry.pack(side="left", fill="x", expand=True, ipady=5)
+        self.entry.bind("<Return>", lambda _event: self.send())
+        ttk.Button(bottom, text="Send", style="Orange.TButton", command=self.send).pack(
+            side="left", padx=(8, 0))
+        self._render_reply(self.assistant.reply("hello"))
+        self.entry.focus_set()
+
+    def _append(self, speaker, text):
+        self.transcript.configure(state="normal")
+        self.transcript.insert("end", f"{speaker}\n{text.strip()}\n\n")
+        self.transcript.configure(state="disabled")
+        self.transcript.see("end")
+
+    def _render_reply(self, reply):
+        self._append("Shopping Assistant", reply["text"])
+        if (reply.get("action") or {}).get("type") == "cart_updated":
+            self.screen.update_cart_badge()
+        for child in self.suggestions.winfo_children():
+            child.destroy()
+        for suggestion in reply.get("suggestions", []):
+            ttk.Button(self.suggestions, text=suggestion,
+                       command=lambda text=suggestion: self.send(text)).pack(side="left", padx=(0, 6))
+
+    def send(self, text=None):
+        message = (text if text is not None else self.message.get()).strip()
+        if not message:
+            return
+        self.message.set("")
+        self._append("You", message)
+        try:
+            reply = self.assistant.reply(message)
+        except StoreError as exc:
+            show_error(exc)
+            return
+        self._render_reply(reply)
+
+
 class HomePage(tk.Frame):
     """Recommendations, recent searches, recently viewed and the product grid."""
 
     def __init__(self, master, screen):
         super().__init__(master, bg=BG)
         self.screen = screen
-        self.api_client = APIClient(timeout=2) if os.getenv("NEXUSCART_API_URL") else None
+        self.api_client = (screen.store.api if getattr(screen.store, "backend_enabled", False)
+                           else APIClient(timeout=2) if os.getenv("NEXUSCART_API_URL") else None)
         self.local_search = SmartSearch(list(screen.store.products.values()))
         self.sections, self._cols = [], 0
 
@@ -1321,8 +1765,9 @@ class HomePage(tk.Frame):
                 result = self.api_client.recommend_products(activity, 6)
                 items = [(item["product"], item["reason"]) for item in result["items"]]
                 return items, result["personalized"]
-            except APIError:
-                pass
+            except APIError as exc:
+                messagebox.showerror("Backend unavailable", str(exc))
+                return [], False
         return s.store.recommendations(username, 6)
 
     def populate(self):
@@ -1340,8 +1785,9 @@ class HomePage(tk.Frame):
                     result = self.api_client.search_products(s.query, category=category, limit=50)
                 else:
                     result = self.local_search.search(s.query, category=category, limit=50)
-            except APIError:
-                result = self.local_search.search(s.query, category=category, limit=50)
+            except APIError as exc:
+                messagebox.showerror("Backend unavailable", str(exc))
+                result = {"results": []}
             products = [item["product"] for item in result["results"]]
             if self.sort.get() == SORTS[1]:
                 products.sort(key=lambda p: p["price"])
@@ -2164,6 +2610,8 @@ class CustomerScreen(tk.Frame):
         bold = (FONT, 10, "bold")
         link_label(right, f"Hello, {user['username']}", self.show_account, fg="#CCCCCC", bg=NAVY,
                    hover=STAR, font=(FONT, 9)).pack(side="left", padx=10)
+        link_label(right, "Ask AI", self.show_assistant, fg="white", bg=NAVY,
+                   hover=STAR, font=bold).pack(side="left", padx=10)
         link_label(right, "Orders", self.show_orders, fg="white", bg=NAVY, hover=STAR, font=bold).pack(side="left", padx=10)
         self.cart_link = link_label(right, "Cart (0)", self.show_cart, fg="white", bg=NAVY, hover=STAR, font=bold)
         self.cart_link.pack(side="left", padx=10)
@@ -2242,6 +2690,9 @@ class CustomerScreen(tk.Frame):
 
     def show_orders(self):
         self._set(OrdersPage(self.content, self))
+
+    def show_assistant(self):
+        self._set(AssistantPage(self.content, self))
 
     def show_account(self, edit=False, then=None):
         self._set(AccountPage(self.content, self, edit=edit, then=then))
@@ -2394,10 +2845,12 @@ class ProductAdminTab(ttk.Frame):
             self.store.save_catalog_csv()
             self.refresh()
             self.images._cache.clear()
+            destination = ("the backend database" if getattr(self.store, "backend_enabled", False)
+                           else "database/products.csv")
             messagebox.showinfo(
                 "Catalog import complete",
                 f"Import finished successfully.\n\nProducts added: {added}\nProducts updated: {updated}\n\n"
-                "The catalog was saved to database/products.csv and images were copied into frontend/assets/images/.")
+                f"The catalog was saved to {destination} and images were copied into frontend/assets/images/.")
         except (OSError, csv.Error, StoreError) as error:
             show_error(error)
 
@@ -2481,6 +2934,14 @@ class ReportTab(ttk.Frame):
             "",
             "Low stock (<= 10)",
             *([f"  {p['name']:<28} {p['stock']}" for p in r["low_stock"]] or ["  (none)"]),
+            "",
+            "FRAUD / ORDER-RISK REVIEW",
+            "-" * 40,
+            *fraud_lines(r["fraud_risks"], currency=CURRENCY),
+            "",
+            "DEMAND FORECAST",
+            "-" * 40,
+            *forecast_lines(r["forecast"]),
         ]
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
@@ -2526,7 +2987,7 @@ class App(tk.Tk):
         global FONT, HEAD, MONO
         FONT, HEAD, MONO = apply_style(self)
         ensure_images()
-        self.store = MockStore()          # <- swap for your real backend later
+        self.store = DjangoStore() if os.getenv("NEXUSCART_API_URL") else MockStore()
         self.images = ImageCache()
         self._wheel_acc = 0.0
         handlers = [("<MouseWheel>", self._on_mousewheel), ("<Button-4>", self._on_button45),
@@ -2648,15 +3109,27 @@ class App(tk.Tk):
 
     def on_login(self, user, new=False):
         if user["role"] == "admin":
-            return self._swap(AdminScreen(self, self.store, user, self.show_login, self.images))
+            return self._swap(AdminScreen(self, self.store, user, self.logout, self.images))
 
         def enter_store():
-            self._swap(CustomerScreen(self, self.store, user, self.show_login, self.images))
+            self._swap(CustomerScreen(self, self.store, user, self.logout, self.images))
 
-        if self.store.profile_complete(user["username"]):
-            enter_store()
-        else:                              # first login: collect delivery details
-            self._swap(OnboardingScreen(self, self.store, user, enter_store, new=new))
+        try:
+            if self.store.profile_complete(user["username"]):
+                enter_store()
+            else:                              # first login: collect delivery details
+                self._swap(OnboardingScreen(self, self.store, user, enter_store, new=new))
+        except StoreError as exc:
+            show_error(exc)
+            self.show_login()
+
+    def logout(self):
+        if getattr(self.store, "backend_enabled", False):
+            try:
+                self.store.logout()
+            except StoreError as exc:
+                show_error(exc)
+        self.show_login()
 
 
 if __name__ == "__main__":

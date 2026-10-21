@@ -1,61 +1,79 @@
 # AI features
 
-All modules live in `backend/app/ai/` and work on plain lists of dicts, so they run (and are tested)
-before the database layer exists. `sample_data.py` provides a seeded demo catalog, reviews and shopper
-activity. Once the models exist, build the same lists from the database.
+The AI engines live in `backend/app/ai/`. Django exposes them through the same API and catalog used by
+the persistent desktop app. They operate on active products, stored reviews, customer activity, carts,
+and completed orders. `sample_data.py` remains available for deterministic demos and isolated tests.
 
 | Module | Status | What it does |
 |--------|--------|--------------|
-| `smart_search.py` | Done | Typo-tolerant, meaning-aware search with synonyms and price words ("keyboard under 100") |
-| `sentiment.py` | Done | VADER sentiment + a trainable TF-IDF/logistic-regression model; review summaries (praise / complaints); flags reviews where stars disagree with the words |
-| `recommender.py` | Done | Hybrid content + collaborative + search-history recommender with a reason on every pick; offline evaluation |
-| `fraud_detection.py` | Planned | Flag suspicious payments / orders (payment_events, repeated failures, odd amounts) |
-| `forecasting.py` | Planned | Demand forecasting for stock planning |
-| `assistant.py` | Planned | Shopping assistant that answers product and order questions |
+| `smart_search.py` | Connected | Typo-tolerant, meaning-aware product search with synonyms and price phrases |
+| `sentiment.py` | Connected | VADER and TF-IDF/logistic-regression sentiment analysis; review summaries and mismatch flags |
+| `recommender.py` | Connected | Hybrid product/content, collaborative, and shopper-history recommendations |
+| `fraud_detection.py` | Connected | Explainable order-risk scores shown to admins for human review |
+| `forecasting.py` | Connected | Recent sales-based demand and restocking estimates shown to admins |
+| `assistant.py` | Connected | In-app shopping assistant for product and order questions |
 
-## Try it
+## Start the backend
+
+From the project root:
 
 ```bash
-pip install -r requirements.txt
-python backend/scripts/ai_demo.py          # prints search, sentiment, recommendations, evaluation
-pytest                                     # includes backend/tests/test_ai.py
-python backend/run.py                      # then open the URLs below
+python3 -m pip install -r requirements.txt
+python3 backend/manage.py migrate
+python3 scripts/import_products.py database/products.csv --django --dry-run
+python3 scripts/import_products.py database/products.csv --django
+python3 backend/manage.py runserver
 ```
+
+`--django` imports the catalog into the database used by the API. Create a customer account in the
+desktop app to use personalized recommendations; product search and review summaries are public.
+Run `pytest` for the deterministic AI and importer tests, and `python3 backend/manage.py test store`
+for API integration tests.
+
+## Django API
 
 | Endpoint | Example |
 |----------|---------|
-| Smart search | `GET /api/products/search?q=wireles mouse` , `?q=earphones under 50` |
-| Review summary | `GET /api/reviews/sentiment/1` |
-| Recommendations | `POST /api/recommendations/` with `{"views":[2],"searches":["keyboard"]}` |
-| Demo shopper | `GET /api/recommendations/demo/5` |
+| Smart search | `GET /api/products/search/?q=wireles%20mouse` |
+| Filtered search | `GET /api/products/search/?q=earphones%20under%2050&in_stock=1` |
+| Review sentiment | `GET /api/products/1/sentiment/` |
+| Product reviews and summary | `GET /api/products/1/reviews/` |
+| Recommendations | `POST /api/recommendations/?k=6` |
+| Shopper activity | `GET /api/activity/` (customer session required) |
 
-## How the pieces work
+The recommendation endpoint uses the authenticated customer's stored purchases, cart, views, searches,
+and positive reviews when available. Anonymous requests can still receive general/popularity-based picks.
+The desktop app records search and product-view activity through the API when backend mode is enabled.
+The assistant appears as **Ask AI** in the customer header; it uses the API-backed store for search,
+recommendations, product reviews, customer orders, and cart actions. Adding an item requires customer
+confirmation. The **Reports** tab in the admin screen includes fraud-risk review and demand forecast
+sections, calculated from orders, payments, and active catalog stock fetched from Django.
 
-**Smart search.** Price phrases become filters and synonyms are added to the query. Two TF-IDF indexes
-score every product: word n-grams (whole terms) and character n-grams (survive typos). The scores are
-blended, with a small bonus when the query appears in the product name.
+Fraud detection is a human-review aid: it does not block orders or establish that fraud occurred.
+Forecasts use recent order history and are estimates, not guarantees. The assistant is rule-based and
+offline; it does not require or call an external language model.
 
-**Sentiment.** VADER (a rule-based lexicon that handles negation and emphasis) works with no training.
-`SentimentAnalyzer.train(reviews)` fits a TF-IDF + logistic-regression model using star ratings as labels
-(4-5 positive, 3 neutral, 1-2 negative). `summarize()` pulls the most-mentioned strongly positive and
-negative sentences per product (a sentence counts only when the review's stars and words agree) and flags
-reviews whose stars contradict their text.
+## How the engines work
 
-**Recommender.** Three signals are scaled to 0-1 and blended (45% content, 35% collaborative, 20% search):
-similarity (same category plus text) to products the shopper bought / carted / viewed, "shoppers like you also bought"
-(item-item cosine similarity), and match to recent searches. Purchases weigh 3, cart 2, views 1 (newer
-views weigh more). Owned and out-of-stock products are never suggested; a shopper with no history gets
-popular, well-rated products. A reason such as "Similar to X" is shown only when the evidence is strong enough;
-otherwise it says "Popular with shoppers like you".
+**Smart search.** Price phrases become filters and synonyms are added to the query. Word n-grams and
+character n-grams score products; the latter help recover results from typos. Product names receive a
+small match bonus.
 
-## Measuring it
+**Sentiment.** VADER is a rule-based baseline. `SentimentAnalyzer.train(reviews)` fits a TF-IDF and
+logistic-regression model using star ratings as labels (4-5 positive, 3 neutral, 1-2 negative).
+Summaries extract strongly positive and negative review sentences and flag star/text mismatches.
 
-`evaluate_hit_rate()` hides one purchase per shopper and checks whether the recommender brings it back
-in its top 5, compared with a "most popular" baseline. The numbers on the synthetic shoppers are a sanity
-check only (the data was generated with category preferences). Re-run it on real orders once you have them.
+**Recommender.** Content similarity, item-item collaborative similarity, and recent search relevance
+are blended. Purchases weigh more than cart items, which weigh more than views. Owned and out-of-stock
+products are excluded; shoppers without history receive general popular picks.
 
-## Next
+**Evaluation.** `evaluate_hit_rate()` hides a purchase per shopper and checks whether it appears in the
+top five recommendations, compared with a popularity baseline. Synthetic-data results are a sanity
+check, not a production quality guarantee.
 
-- Connect the engines to the database (`services/`) instead of `sample_data`.
-- Frontend: call `/api/products/search` and `/api/recommendations/` from `api_client.py`.
-- Build `fraud_detection.py`, `forecasting.py`, then `assistant.py`.
+## Remaining AI work
+
+- Evaluate recommendation quality against production usage with privacy-appropriate metrics.
+- Build more real sales history before relying on forecasts; little history yields low confidence.
+- Payment confirmation is currently a mock flow; connect and verify a payment provider before accepting
+  real payments.

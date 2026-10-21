@@ -11,10 +11,21 @@ reviews whose stars disagree with the words (possible fake or mistaken ratings).
 """
 import re
 from collections import Counter
+from pathlib import Path
 
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+import vaderSentiment.vaderSentiment as vader_module
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer as _VaderAnalyzer
 
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+
+class _WarningFreeVaderAnalyzer(_VaderAnalyzer):
+    def __init__(self, lexicon_file="vader_lexicon.txt", emoji_lexicon="emoji_utf8_lexicon.txt"):
+        data_dir = Path(vader_module.__file__).resolve().parent
+        self.lexicon_full_filepath = (data_dir / lexicon_file).read_text(encoding="utf-8")
+        self.lexicon = self.make_lex_dict()
+        self.emoji_full_filepath = (data_dir / emoji_lexicon).read_text(encoding="utf-8")
+        self.emojis = self.make_emoji_dict()
 
 
 def label_from_rating(rating):
@@ -23,7 +34,7 @@ def label_from_rating(rating):
 
 class SentimentAnalyzer:
     def __init__(self, threshold=0.25):
-        self._vader = SentimentIntensityAnalyzer()
+        self._vader = _WarningFreeVaderAnalyzer()
         self.threshold = threshold
         self.model = None
 

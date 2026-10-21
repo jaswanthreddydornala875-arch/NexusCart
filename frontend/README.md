@@ -3,40 +3,57 @@
 ## Files
 
 - `main.py` — full Tkinter store UI, including customer and admin screens.
-- `api_client.py` — standard-library HTTP client for the Flask API.
+- `api_client.py` — standard-library HTTP client for the Django API.
 - `theme.py` — shared colours, fonts and ttk styles.
-- `assets/images/{electronics,clothing,footwear,accessories}/` — product image folders.
-- `pages/`, `screens/`, `widgets/` — reserved for splitting the UI into smaller modules later.
+- `assets/images/` — product image folders grouped by category.
 
-## Run
+## Run with the persistent backend
 
-From the NexusCart project root:
-
-```bash
-python frontend/main.py
-```
-
-Optional image support for JPG/WEBP and smoother image resizing:
+From the project root, install the requirements and initialize the Django database:
 
 ```bash
-pip install pillow
+python3 -m pip install -r requirements.txt
+python3 backend/manage.py migrate
+python3 backend/manage.py createsuperuser
 ```
 
-## Product catalog and inventory import
+In one terminal, start the API:
 
-In the Admin screen, open **Products** and choose **Import / Update CSV + Images**. Select the CSV, then select the folder containing the product images. The CSV must include `name`, `category`, `price`, and `stock`; `description` and `image_path` are optional. `product_id` is optional. If a row has a `product_id` matching an existing product, that product is updated; otherwise a matching product name is updated; otherwise a new product is added. Rows with image filenames are copied into `frontend/assets/images/<category>/`.
-
-Example CSV header:
-
-```csv
-product_id,name,category,price,stock,description,image_path
-,Wireless Mouse,Electronics,799,25,Ergonomic wireless mouse,wireless_mouse.jpg
+```bash
+python3 backend/manage.py runserver
 ```
 
-For an image path, you can provide a filename such as `wireless_mouse.jpg` (the app looks in the selected image folder), or a project-root-relative path such as `frontend/assets/images/electronics/wireless_mouse.jpg`. Keep image filenames and extensions accurate. After a successful import, the catalog is saved to `database/products.csv`; manual Add, Update and Delete actions also save the catalog. Import is an upsert: it adds new products and updates matching products without deleting products absent from the CSV. The catalog and images persist locally across app restarts.
+In another terminal, start the desktop app in backend mode:
 
-## Backend integration status
+```bash
+NEXUSCART_API_URL=http://127.0.0.1:8000/api python3 frontend/main.py
+```
 
-The UI uses an in-memory `MockStore` for account, cart, checkout, reviews and admin interactions. Backend AI search and recommendations are opt-in: install the root `requirements.txt`, start the Flask app from `backend/` with `flask --app app:create_app run`, then launch the UI with `NEXUSCART_API_URL=http://127.0.0.1:5000/api python frontend/main.py`. If the AI API is unavailable, the home screen falls back to `MockStore` search and recommendations.
+The Django API persists accounts, profiles, products, cart contents, orders, reviews, and shopper
+activity. Use the superuser created above to sign in to the admin screens. A normal customer account
+can be created from the sign-up screen. Without `NEXUSCART_API_URL`, the app uses its in-memory demo
+store instead.
 
-The backend reads products from `database/products.csv` when it contains product rows. Reviews and shopper activity are still held only in the UI's in-memory store, so backend sentiment summaries use demo reviews when the catalog is empty and have no live reviews when a real catalog is loaded. Account, cart, checkout and admin actions are not connected to the backend; the demo store does not persist those records across restarts and is not production authentication/payment handling.
+In the customer screen, choose **Ask AI** to search products, get recommendations, ask about orders or
+reviews, and add products to the cart after confirming. In the admin screen, the **Reports** tab shows
+explainable order-risk flags and a demand/restocking forecast based on stored orders and stock. Risk
+flags are for human review only; forecasts are estimates and need sufficient sales history.
+
+To load the project catalog into the Django database, run migrations first and then use the importer:
+
+```bash
+python3 scripts/import_products.py database/products.csv --django --dry-run
+python3 scripts/import_products.py database/products.csv --django
+```
+
+The import is an upsert by SKU; it does not remove products missing from the file. For image support
+in the desktop app, optionally install Pillow:
+
+```bash
+python3 -m pip install pillow
+```
+
+## Other backend components
+
+Flask remains available for the separate AI demonstration endpoints and the legacy importer mode.
+The persistent desktop app uses Django as its canonical API and database.

@@ -4,8 +4,12 @@ The AI modules work on plain lists of dicts, so they run (and are tested) before
 layer exists. Once the models are done, build the same lists from the database instead.
 Everything here is synthetic and seeded, so results are repeatable.
 """
+import csv
+import os
 import random
+import re
 from datetime import date, timedelta
+from pathlib import Path
 
 _PRODUCT_SEED = [
     # name, category, price, stock, description
@@ -41,6 +45,33 @@ _PRODUCT_SEED = [
     ("Electric Kettle", "Kitchen", 25.50, 3, "1.7 L electric kettle with auto shut-off, boil-dry protection and a rapid 3-minute boil."),
 ]
 
+_DEFAULT_ASPECTS = (["Good quality and great value.", "Exactly as described."],
+                    ["The quality is not what I expected.", "It arrived damaged."])
+
+
+def _csv_path():
+    env = os.getenv("PRODUCTS_CSV")
+    return Path(env) if env else Path(__file__).resolve().parents[3] / "database" / "products.csv"
+
+
+def _read_catalog_csv(path):
+    """Products from database/products.csv (the same file the bulk importer reads)."""
+    out = []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            r = {str(k).strip().lower(): (v or "").strip() for k, v in r.items() if k}
+            if r.get("is_active", "").lower() in ("0", "false", "no", "n", "inactive", "off"):
+                continue
+            try:
+                price = float(re.sub(r"[^\d.]", "", r.get("price", "").replace(",", "")))
+                stock = int(float(r.get("stock") or 0))
+            except ValueError:
+                continue
+            if r.get("name") and r.get("category"):
+                out.append((r["name"], r["category"], price, stock, r.get("description", "")))
+    return out
+
+
 _OPENERS = {
     "pos": ["Absolutely love this {n}.", "Really happy with the {n}.", "The {n} exceeded my expectations.",
             "Great purchase, the {n} works perfectly."],
@@ -72,8 +103,16 @@ _TITLES = {"pos": ["Love it", "Excellent", "Highly recommended", "Worth the mone
 
 def products():
     """30 products: id, name, category, price, stock, description."""
+    rows = []
+    path = _csv_path()
+    if path.is_file():
+        try:
+            rows = _read_catalog_csv(path)
+        except (OSError, ValueError):
+            rows = []
+    rows = rows or _PRODUCT_SEED                       # fall back to the built-in demo catalog
     return [{"id": i, "name": n, "category": c, "price": p, "stock": s, "description": d}
-            for i, (n, c, p, s, d) in enumerate(_PRODUCT_SEED, start=1)]
+            for i, (n, c, p, s, d) in enumerate(rows, start=1)]
 
 
 def reviews(seed=42, per_product=(5, 9)):
@@ -89,7 +128,7 @@ def reviews(seed=42, per_product=(5, 9)):
             r = rng.random()
             tone = "pos" if r < quality else ("neu" if r < quality + (1 - quality) * 0.4 else "neg")
             rating = {"pos": rng.choice([5, 5, 4]), "neu": 3, "neg": rng.choice([1, 2, 2])}[tone]
-            praise, complaints = _ASPECTS[p["category"]]
+            praise, complaints = _ASPECTS.get(p["category"], _DEFAULT_ASPECTS)
             aspect = rng.choice(praise if tone == "pos" else complaints if tone == "neg" else praise + complaints)
             text = f"{rng.choice(_OPENERS[tone]).format(n=p['name'])} {aspect}"
             if rng.random() < 0.04:                           # rare mismatch: stars disagree with the words
